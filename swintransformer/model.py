@@ -1,4 +1,5 @@
 # model.py — TensorFlow 2.18 / Keras 3 compatible
+
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.layers import Dense, Dropout, Conv2D, LayerNormalization, GlobalAveragePooling1D
@@ -19,7 +20,7 @@ class Mlp(tf.keras.layers.Layer):
     def __init__(self, in_features, hidden_features=None, out_features=None, drop=0., prefix=''):
         super().__init__()
         self.prefix = _sanitize(prefix)
-        out_features   = out_features   or in_features
+        out_features    = out_features    or in_features
         hidden_features = hidden_features or in_features
         self.fc1  = Dense(hidden_features, name=f'{self.prefix}_mlp_fc1')
         self.fc2  = Dense(out_features,  name=f'{self.prefix}_mlp_fc2')
@@ -61,7 +62,12 @@ class WindowAttention(tf.keras.layers.Layer):
         self.proj      = Dense(dim, name=f'{self.prefix}_attn_proj')
         self.proj_drop = Dropout(proj_drop)
 
+        # buffers (non-trainable) — define here, init in build()
+        self.relative_position_bias_table = None
+        self.relative_position_index_var  = None  # ResourceVariable to avoid out-of-scope
+
     def build(self, input_shape):
+        # bias table (trainable)
         self.relative_position_bias_table = self.add_weight(
             name=f'{self.prefix}_attn_relative_position_bias_table',
             shape=((2 * self.window_size[0] - 1) * (2 * self.window_size[1] - 1), self.num_heads),
@@ -69,20 +75,28 @@ class WindowAttention(tf.keras.layers.Layer):
             trainable=True
         )
 
-        coords_h = np.arange(self.window_size[0])
-        coords_w = np.arange(self.window_size[1])
+        # precompute relative position index (numpy -> constant initializer -> ResourceVariable)
+        Wh, Ww = self.window_size
+        coords_h = np.arange(Wh)
+        coords_w = np.arange(Ww)
         coords   = np.stack(np.meshgrid(coords_h, coords_w, indexing='ij'))
-        coords_flatten   = coords.reshape(2, -1)
-        relative_coords  = coords_flatten[:, :, None] - coords_flatten[:, None, :]
-        relative_coords  = relative_coords.transpose([1, 2, 0])
-        relative_coords[:, :, 0] += self.window_size[0] - 1
-        relative_coords[:, :, 1] += self.window_size[1] - 1
-        relative_coords[:, :, 0] *= (2 * self.window_size[1] - 1)
+        coords_flatten  = coords.reshape(2, -1)
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
+        relative_coords = relative_coords.transpose([1, 2, 0])
+        relative_coords[:, :, 0] += Wh - 1
+        relative_coords[:, :, 1] += Ww - 1
+        relative_coords[:, :, 0] *= (2 * Ww - 1)
+        relative_position_index = relative_coords.sum(-1).astype('int32')  # [N, N]
 
-        relative_position_index = relative_coords.sum(-1).astype(np.int64)  # [N, N], N=Wh*Ww
-        # store as non-trainable tensor
-        self.relative_position_index = tf.convert_to_tensor(relative_position_index)
-        self.built = True
+        self.relative_position_index_var = self.add_weight(
+            name=f'{self.prefix}_attn_relative_position_index',
+            shape=relative_position_index.shape,
+            dtype=tf.int32,
+            initializer=tf.constant_initializer(relative_position_index),
+            trainable=False,
+        )
+
+        super().build(input_shape)
 
     def call(self, x, mask=None, training=None):
         B_, N, C = x.get_shape().as_list()
@@ -95,17 +109,14 @@ class WindowAttention(tf.keras.layers.Layer):
         q = q * self.scale
         attn = (q @ tf.transpose(k, perm=[0, 1, 3, 2]))
 
-        relative_position_bias = tf.gather(
+        Wh, Ww = self.window_size
+        rel_bias = tf.gather(
             self.relative_position_bias_table,
-            tf.reshape(self.relative_position_index, shape=[-1])
+            tf.reshape(self.relative_position_index_var, [-1])  # int32 indices OK
         )
-        relative_position_bias = tf.reshape(
-            relative_position_bias,
-            shape=[self.window_size[0] * self.window_size[1],
-                   self.window_size[0] * self.window_size[1], -1]
-        )
-        relative_position_bias = tf.transpose(relative_position_bias, perm=[2, 0, 1])
-        attn = attn + tf.expand_dims(relative_position_bias, axis=0)
+        rel_bias = tf.reshape(rel_bias, shape=[Wh * Ww, Wh * Ww, -1])  # [N, N, num_heads]
+        rel_bias = tf.transpose(rel_bias, perm=[2, 0, 1])              # [num_heads, N, N]
+        attn = attn + tf.expand_dims(rel_bias, axis=0)
 
         if mask is not None:
             nW   = tf.shape(mask)[0]
@@ -170,19 +181,16 @@ class SwinTransformerBlock(tf.keras.layers.Layer):
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp  = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, drop=drop, prefix=self.prefix)
 
-        self.attn_mask = None
+        # store mask as non-trainable weight to avoid graph-scope issues
+        self.attn_mask_var = None
 
     def build(self, input_shape):
         if self.shift_size > 0:
             H, W = self.input_resolution
-            # build mask via numpy slicing, then convert to tensor
+            Wh = Ww = self.window_size
             img_mask_np = np.zeros([1, H, W, 1], dtype=np.float32)
-            h_slices = (slice(0, -self.window_size),
-                        slice(-self.window_size, -self.shift_size),
-                        slice(-self.shift_size, None))
-            w_slices = (slice(0, -self.window_size),
-                        slice(-self.window_size, -self.shift_size),
-                        slice(-self.shift_size, None))
+            h_slices = (slice(0, -Wh), slice(-Wh, -self.shift_size), slice(-self.shift_size, None))
+            w_slices = (slice(0, -Ww), slice(-Ww, -self.shift_size), slice(-self.shift_size, None))
             cnt = 0
             for h in h_slices:
                 for w in w_slices:
@@ -190,13 +198,22 @@ class SwinTransformerBlock(tf.keras.layers.Layer):
                     cnt += 1
 
             img_mask = tf.convert_to_tensor(img_mask_np, dtype=tf.float32)
-            mask_windows = window_partition(img_mask, self.window_size)
+            mask_windows = window_partition(img_mask, self.window_size)  # [nW*B, Wh, Ww, 1]
             mask_windows = tf.reshape(mask_windows, shape=[-1, self.window_size * self.window_size])
             attn_mask = tf.expand_dims(mask_windows, axis=1) - tf.expand_dims(mask_windows, axis=2)
             attn_mask = tf.where(attn_mask != 0, -100.0, attn_mask)
             attn_mask = tf.where(attn_mask == 0,   0.0,   attn_mask)
-            self.attn_mask = attn_mask  # Tensor is fine; no need to register as weight
-        self.built = True
+
+            nW = (H // self.window_size) * (W // self.window_size)
+            # create as ResourceVariable via add_weight (non-trainable)
+            self.attn_mask_var = self.add_weight(
+                name=f'{self.prefix}_attn_mask',
+                shape=(nW, self.window_size * self.window_size, self.window_size * self.window_size),
+                dtype=tf.float32,
+                initializer=tf.constant_initializer(attn_mask.numpy()),
+                trainable=False,
+            )
+        super().build(input_shape)
 
     def call(self, x, training=None):
         H, W = self.input_resolution
@@ -207,25 +224,19 @@ class SwinTransformerBlock(tf.keras.layers.Layer):
         x = self.norm1(x)
         x = tf.reshape(x, shape=[-1, H, W, C])
 
-        # cyclic shift
         shifted_x = tf.roll(x, shift=[-self.shift_size, -self.shift_size], axis=[1, 2]) if self.shift_size > 0 else x
 
-        # partition windows
         x_windows = window_partition(shifted_x, self.window_size)
         x_windows = tf.reshape(x_windows, shape=[-1, self.window_size * self.window_size, C])
 
-        # W-MSA / SW-MSA
-        attn_windows = self.attn(x_windows, mask=self.attn_mask, training=training)
+        attn_windows = self.attn(x_windows, mask=self.attn_mask_var, training=training)
 
-        # merge windows
         attn_windows = tf.reshape(attn_windows, shape=[-1, self.window_size, self.window_size, C])
         shifted_x = window_reverse(attn_windows, self.window_size, H, W, C)
 
-        # reverse cyclic shift
         x = tf.roll(shifted_x, shift=[self.shift_size, self.shift_size], axis=[1, 2]) if self.shift_size > 0 else shifted_x
         x = tf.reshape(x, shape=[-1, H * W, C])
 
-        # FFN + DropPath
         x = shortcut + self.drop_path(x, training=training)
         x = x + self.drop_path(self.mlp(self.norm2(x), training=training), training=training)
         return x
@@ -399,6 +410,7 @@ def SwinTransformer(model_name='swin_tiny_224', num_classes=1000, include_top=Tr
         img_size=cfg['input_size'], window_size=cfg['window_size'],
         embed_dim=cfg['embed_dim'], depths=cfg['depths'], num_heads=cfg['num_heads']
     )
+
     # Build graph
     _ = net(tf.keras.Input(shape=(cfg['input_size'][0], cfg['input_size'][1], 3)))
 
@@ -411,9 +423,13 @@ def SwinTransformer(model_name='swin_tiny_224', num_classes=1000, include_top=Tr
     if pretrained_ckpt:
         if tf.io.gfile.isdir(pretrained_ckpt):
             pretrained_ckpt = f'{pretrained_ckpt}/{model_name}.ckpt'
-        if use_tpu:
-            load_locally = tf.saved_model.LoadOptions(experimental_io_device='/job:localhost')
-            net.load_weights(pretrained_ckpt, options=load_locally)
-        else:
+
+        # Keras 3 no longer supports direct `.ckpt` in load_weights. Fallback to tf.train.Checkpoint.
+        try:
             net.load_weights(pretrained_ckpt)
+        except ValueError:
+            ckpt = tf.train.Checkpoint(model=net)
+            # expect_partial(): ckpt vars may not perfectly match Keras names
+            ckpt.restore(pretrained_ckpt).expect_partial()
+
     return net
